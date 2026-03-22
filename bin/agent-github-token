@@ -1,0 +1,72 @@
+#!/bin/bash
+#
+# A wrapper script to authenticate the GitHub CLI (`gh`) as a GitHub App.
+#
+# This script retrieves your GitHub App configuration, calls a helper
+# program to generate a short-lived installation access token, and uses
+# that token to log in.
+
+set -e
+
+# --- Configuration -----------------------------------------------------------
+# Replace the placeholder values below with your GitHub App's credentials.
+#
+# GH_APP_ID: Found on your app's main settings page.
+# GH_APP_INSTALLATION_ID: Found in the URL after installing the app
+#                         (e.g., .../installations/12345678).
+# -----------------------------------------------------------------------------
+GH_APP_ID="<Your-App-ID>"
+GH_APP_INSTALLATION_ID="<Your-Installation-ID>"
+
+# --- Script Body -------------------------------------------------------------
+# You shouldn't need to edit anything below this line.
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+HELPER_NAME="gh-app-token-generator"
+HELPER_PATH="${SCRIPT_DIR}/${HELPER_NAME}"
+
+# --- Pre-flight Checks ---
+# Check if running on macOS, as this script relies on the 'security' command.
+if [[ "$(uname)" != "Darwin" ]]; then
+  echo "Error: This script is designed for macOS and relies on the 'security' command." >&2
+  echo "It will not run on other operating systems." >&2
+  exit 1
+fi
+
+# Check if the 'gh' command is available.
+if ! command -v gh &>/dev/null; then
+  echo "Error: The GitHub CLI ('gh') is not installed or not in your PATH." >&2
+  echo "Please install it from https://github.com/cli/cli#installation" >&2
+  exit 1
+fi
+
+# Check if the helper program exists.
+if [[ ! -f "${HELPER_PATH}" ]]; then
+  echo "Error: The helper program '${HELPER_NAME}' was not found in the same directory as this script." >&2
+  echo "Please build it first by running 'go build -o "${HELPER_PATH}" ./cmd/gh-app-token-generator' from the repository root." >&2
+  exit 1
+fi
+
+# --- Token Generation and Authentication ---
+echo "🤖 Generating GitHub App installation token..."
+
+# Call the helper to generate the token.
+# The token is printed to stdout.
+TOKEN=$("${HELPER_PATH}" "${GH_APP_ID}" "${GH_APP_INSTALLATION_ID}")
+if [[ -z "${TOKEN}" ]]; then
+  echo "Error: Failed to generate an installation token. The helper program produced no output." >&2
+  exit 1
+fi
+
+echo "🔐 Authenticating GitHub CLI..."
+
+# Use the generated token to log in with the 'gh' CLI.
+# The '--with-token' flag reads the token from standard input.
+if echo "${TOKEN}" | gh auth login --hostname github.com --with-token; then
+  echo "✅ Successfully authenticated 'gh' as your GitHub App."
+  echo "Run 'gh auth status' to verify."
+else
+  echo "Error: 'gh auth login' failed." >&2
+  exit 1
+fi
