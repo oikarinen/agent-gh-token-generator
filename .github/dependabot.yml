@@ -1,0 +1,34 @@
+# .github/dependabot.yml
+#
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+
+version: 2
+updates:
+  # Maintain dependencies for Go modules
+  - package-ecosystem: "gomod"
+    directory: "/" # `go.mod` is in the root
+    schedule:
+      interval: "weekly"
+    # Add commit message prefix for Go module updates
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      go-dependencies:
+        patterns:
+          - "*" # Group all Go module updates
+
+  # Maintain dependencies for GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/" # Workflows are in .github/workflows
+    schedule:
+      interval: "weekly"
+    # Add commit message prefix for GitHub Actions updates
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns:
+          - "*" # Group all GitHub Actions updates

@@ -1,0 +1,48 @@
+# .goreleaser.yml
+#
+# Make sure to check the documentation at https://goreleaser.com
+builds:
+  - id: "gh-app-token-generator"
+    # The main Go file to build.
+    main: ./cmd/gh-app-token-generator
+    # The name of the binary.
+    binary: gh-app-token-generator
+    # Target platforms.
+    goos:
+      - darwin # macOS
+    goarch:
+      - amd64
+      - arm64
+    # Set the modified time of the binary to the commit's author date.
+    mod_timestamp: '{{ .CommitTimestamp }}'
+
+# Create archives of the binaries.
+archives:
+  - format: tar.gz
+    # This name template makes the OS and Arch compatible with the naming
+    # convention expected by GoReleaser.
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - bin/agent-github-token
+
+# Create a checksum file for all artifacts.
+checksum:
+  name_template: 'checksums.txt'
+
+# Create a snapshot version when running on non-tagged commits.
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+
+# Generate a changelog based on commit messages.
+changelog:
+  sort: asc
+  filters:
+    # Exclude certain commit message prefixes from the changelog.
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'Merge pull request'
+      - 'Merge branch'
