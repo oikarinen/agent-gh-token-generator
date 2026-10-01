@@ -8,7 +8,7 @@ This section outlines the standard workflow for building, testing, and modifying
 
 ### Prerequisites
 
-*   Go (version 1.22 or later)
+*   Go (version 1.26 or later)
 *   `golangci-lint` for linting
 
 ### Building the Code
