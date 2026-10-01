@@ -23,12 +23,19 @@ type InstallationToken struct {
 
 // GetToken generates and returns a GitHub App installation access token.
 func GetToken(appID, installationID string) (string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	return getToken(appID, installationID, getPrivateKeyFromKeychain, client, "https://api.github.com")
+}
+
+// getToken implements GetToken with its dependencies passed in, so tests can
+// supply a key and a fake GitHub API.
+func getToken(appID, installationID string, readKey func() ([]byte, error), client *http.Client, baseURL string) (string, error) {
 	if _, err := strconv.ParseInt(appID, 10, 64); err != nil {
 		return "", fmt.Errorf("invalid app ID: %s", appID)
 	}
 
 	// Fetch the private key from macOS Keychain
-	keyBytes, err := getPrivateKeyFromKeychain()
+	keyBytes, err := readKey()
 	if err != nil {
 		return "", fmt.Errorf("error fetching private key from keychain: %w", err)
 	}
@@ -46,7 +53,7 @@ func GetToken(appID, installationID string) (string, error) {
 	}
 
 	// Get the installation access token from GitHub API
-	accessToken, err := getInstallationAccessToken("https://api.github.com", installationID, signedToken)
+	accessToken, err := getInstallationAccessToken(client, baseURL, installationID, signedToken)
 	if err != nil {
 		return "", fmt.Errorf("error getting installation access token: %w", err)
 	}
@@ -64,6 +71,11 @@ func getPrivateKeyFromKeychain() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("keychain command failed: %w", err)
 	}
+	return decodeKeychainKey(output)
+}
+
+// decodeKeychainKey decodes the base64-encoded PEM key stored in the Keychain.
+func decodeKeychainKey(output []byte) ([]byte, error) {
 	if len(output) == 0 {
 		return nil, fmt.Errorf("private key not found in keychain")
 	}
@@ -92,7 +104,7 @@ func createJWT(appID string, privateKey *rsa.PrivateKey) (string, error) {
 }
 
 // getInstallationAccessToken uses the JWT to request an installation access token from GitHub.
-func getInstallationAccessToken(baseURL, installationID, jwtToken string) (*string, error) {
+func getInstallationAccessToken(client *http.Client, baseURL, installationID, jwtToken string) (*string, error) {
 	// Validate that installationID is a number to prevent theoretical SSRF
 	if _, err := strconv.ParseInt(installationID, 10, 64); err != nil {
 		return nil, fmt.Errorf("invalid installation ID: %s", installationID)
@@ -110,7 +122,6 @@ func getInstallationAccessToken(baseURL, installationID, jwtToken string) (*stri
 	req.Header.Set("User-Agent", "github-app-authtoken-client/1.0")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
-	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
