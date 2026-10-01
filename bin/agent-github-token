@@ -44,7 +44,7 @@ fi
 # Check if the helper program exists.
 if [[ ! -f "${HELPER_PATH}" ]]; then
   echo "Error: The helper program '${HELPER_NAME}' was not found in the same directory as this script." >&2
-  echo "Please build it first by running 'go build -o "${HELPER_PATH}" ./cmd/gh-app-token-generator' from the repository root." >&2
+  echo "Please build it first by running 'go build -o ${HELPER_PATH} ./cmd/gh-app-token-generator' from the repository root." >&2
   exit 1
 fi
 
