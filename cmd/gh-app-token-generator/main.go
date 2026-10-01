@@ -2,25 +2,33 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/oikarinen/agent-gh-token-generator/internal/authtoken"
 )
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "Usage: ", os.Args[0], " <app_id> <installation_id>")
-		os.Exit(1)
+	os.Exit(run(os.Args, os.Stdout, os.Stderr, authtoken.GetToken))
+}
+
+// run executes the command and returns its exit code. The token source is
+// passed in so tests can exercise argument handling and output.
+func run(args []string, stdout, stderr io.Writer, getToken func(appID, installationID string) (string, error)) int {
+	if len(args) != 3 {
+		fmt.Fprintln(stderr, "Usage: ", args[0], " <app_id> <installation_id>")
+		return 1
 	}
 
-	appID := os.Args[1]
-	installationID := os.Args[2]
+	appID := args[1]
+	installationID := args[2]
 
-	accessToken, err := authtoken.GetToken(appID, installationID)
+	accessToken, err := getToken(appID, installationID)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error: ", err)
-		os.Exit(1)
+		fmt.Fprintln(stderr, "Error: ", err)
+		return 1
 	}
 
-	fmt.Print(accessToken)
+	fmt.Fprint(stdout, accessToken)
+	return 0
 }
