@@ -21,7 +21,7 @@ builds:
 
 # Create archives of the binaries.
 archives:
-  - format: tar.gz
+  - formats: [ tar.gz ]
     # This name template makes the OS and Arch compatible with the naming
     # convention expected by GoReleaser.
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
@@ -36,7 +36,7 @@ checksum:
 
 # Create a snapshot version when running on non-tagged commits.
 snapshot:
-  name_template: "{{ incpatch .Version }}-next"
+  version_template: "{{ incpatch .Version }}-next"
 
 # Generate a changelog based on commit messages.
 changelog:
