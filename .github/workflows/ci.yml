@@ -13,6 +13,9 @@ on:
 permissions:
   contents: read
 
+env:
+  GORELEASER_VERSION: v2.18.2
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -49,11 +52,53 @@ jobs:
         with:
           version: v2.11.4
 
+  wrapper:
+    name: Wrapper script
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: ShellCheck
+        run: shellcheck bin/agent-github-token test/*.sh
+      - name: Test
+        run: test/agent-github-token_test.sh
+
+  release-check:
+    name: Release check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26'
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          version: ${{ env.GORELEASER_VERSION }}
+          install-only: true
+      - name: Check config
+        run: goreleaser check
+      - name: Snapshot build
+        run: goreleaser release --snapshot --clean
+      - name: Verify archive layout
+        # The wrapper looks for the helper in its own directory.
+        run: |
+          for archive in dist/*.tar.gz; do
+            contents="$(tar -tzf "${archive}")"
+            printf '%s:\n%s\n' "${archive}" "${contents}"
+            grep -qx 'bin/gh-app-token-generator' <<< "${contents}"
+            grep -qx 'bin/agent-github-token' <<< "${contents}"
+          done
+
   release:
     name: Release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [ build, lint ]
+    needs: [ build, lint, wrapper, release-check ]
     permissions:
       contents: write # create the GitHub release and upload assets
     steps:
@@ -68,7 +113,7 @@ jobs:
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
-          version: v2.18.2
+          version: ${{ env.GORELEASER_VERSION }}
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

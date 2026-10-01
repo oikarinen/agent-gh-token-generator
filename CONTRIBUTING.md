@@ -10,6 +10,8 @@ This section outlines the standard workflow for building, testing, and modifying
 
 *   Go (version 1.26 or later)
 *   `golangci-lint` for linting
+*   `shellcheck` for the wrapper script
+*   `goreleaser` (optional) for checking the release build
 
 ### Building the Code
 
@@ -33,6 +35,24 @@ We use `golangci-lint` to enforce code style and quality. To run the linter loca
 
 ```sh
 golangci-lint run
+```
+
+### Testing the Wrapper Script
+
+The wrapper tests run `bin/agent-github-token` against stub versions of the helper and `gh`, so they need no GitHub App or Keychain:
+
+```sh
+shellcheck bin/agent-github-token test/*.sh
+test/agent-github-token_test.sh
+```
+
+### Checking the Release Build
+
+CI validates the GoReleaser config and builds a snapshot on every pull request. To do the same locally:
+
+```sh
+goreleaser check
+goreleaser release --snapshot --clean
 ```
 
 ### GitHub Actions Style Guide
