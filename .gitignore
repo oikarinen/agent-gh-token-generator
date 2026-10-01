@@ -1,3 +1,4 @@
 .cache
 .go
-.golangci.bck.yml
+/bin/gh-app-token-generator
+/dist
