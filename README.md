@@ -83,7 +83,7 @@ Follow these steps to create your GitHub App and configure this tool.
     Go to the [GitHub Releases page](https://github.com/oikarinen/agent-gh-token-generator/releases) for this repository. Since this tool currently only supports macOS, download the macOS (darwin) archive (e.g., `..._darwin_...tar.gz`).
 
 2.  **Extract the archive:**
-    Unpack the `.tar.gz` file. It will create a directory containing the `gh-app-token-generator` binary and a `bin/agent-github-token` script (the binary is typically at the archive root, while the script is inside `bin/`). Ensure that the `gh-app-token-generator` binary is placed alongside the `bin/agent-github-token` script (for example, by moving the binary into the `bin/` directory, or by moving both files into a common directory in your cloned repository) so that the script can find the helper binary when it runs.
+    Unpack the `.tar.gz` file. Both the `gh-app-token-generator` binary and the `agent-github-token` script are placed in its `bin/` directory. Keep them together: the script looks for the helper binary in its own directory.
 
 3.  **Configure the wrapper script:**
     Edit the `bin/agent-github-token` file and replace the placeholder values at the top of the script with your **App ID** and **Installation ID**.
