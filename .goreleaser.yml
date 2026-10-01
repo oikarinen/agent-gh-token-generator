@@ -1,12 +1,15 @@
 # .goreleaser.yml
 #
 # Make sure to check the documentation at https://goreleaser.com
+version: 2
+
 builds:
   - id: "gh-app-token-generator"
     # The main Go file to build.
     main: ./cmd/gh-app-token-generator
-    # The name of the binary.
-    binary: gh-app-token-generator
+    # The name of the binary. Placed under bin/ so it lands next to the
+    # bin/agent-github-token wrapper, which expects it in the same directory.
+    binary: bin/gh-app-token-generator
     # Target platforms.
     goos:
       - darwin # macOS
