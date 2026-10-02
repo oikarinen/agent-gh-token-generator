@@ -37,8 +37,34 @@ Commands:
                Your own gh login is not changed.
   setup-git    Make git use these tokens for https://github.com in the current
                repository
+  claude-settings
+               Print Claude Code settings that limit Claude's GitHub access to
+               this App's token
   logout       Remove the stored tokens from the Keychain
 EOF
+}
+
+# client_id_set succeeds if GH_APP_CLIENT_ID holds a client ID, not the empty
+# value or the "<...>" placeholder from the configuration section.
+client_id_set() {
+  [[ -n "${GH_APP_CLIENT_ID}" && "${GH_APP_CLIENT_ID}" != \<* ]]
+}
+
+require_client_id() {
+  if ! client_id_set; then
+    echo "Error: Set GH_APP_CLIENT_ID at the top of this script (or in the environment) to your GitHub App's Client ID." >&2
+    exit 1
+  fi
+}
+
+# run_helper ARGS...: run the helper, limited to the configured App's tokens
+# when a client ID is set.
+run_helper() {
+  if client_id_set; then
+    "${HELPER_PATH}" "$@" --client-id "${GH_APP_CLIENT_ID}"
+  else
+    "${HELPER_PATH}" "$@"
+  fi
 }
 
 # setup_git configures the current repository to get credentials for
@@ -54,11 +80,15 @@ setup_git() {
   fi
 
   local key="credential.https://github.com.helper"
+  local helper="!'${HELPER_PATH}' git-credential"
+  if client_id_set; then
+    helper+=" --client-id '${GH_APP_CLIENT_ID}'"
+  fi
   # The empty value clears helpers configured elsewhere for github.com (such as
   # osxkeychain or 'gh auth setup-git'), so only this one is used.
   git config --local --unset-all "${key}" || true
   git config --local --add "${key}" ""
-  git config --local --add "${key}" "!'${HELPER_PATH}' git-credential"
+  git config --local --add "${key}" "${helper}"
   echo "git now uses ${PROGRAM} tokens for https://github.com in this repository."
 
   # Credential helpers only apply to HTTPS remotes.
@@ -104,15 +134,14 @@ fi
 
 case "${cmd}" in
   login)
-    # Still empty or the "<...>" placeholder from the configuration section.
-    if [[ -z "${GH_APP_CLIENT_ID}" || "${GH_APP_CLIENT_ID}" == \<* ]]; then
-      echo "Error: Set GH_APP_CLIENT_ID at the top of this script (or in the environment) to your GitHub App's Client ID." >&2
-      exit 1
-    fi
+    require_client_id
     exec "${HELPER_PATH}" login "${GH_APP_CLIENT_ID}"
     ;;
-  status | token | logout)
+  status | logout)
     exec "${HELPER_PATH}" "${cmd}" "$@"
+    ;;
+  token)
+    run_helper token "$@"
     ;;
   gh)
     if ! command -v gh &>/dev/null; then
@@ -121,11 +150,15 @@ case "${cmd}" in
       exit 1
     fi
     # On failure the helper explains why (for example, that login is needed).
-    TOKEN="$("${HELPER_PATH}" token)"
+    TOKEN="$(run_helper token)"
     GH_TOKEN="${TOKEN}" exec gh "$@"
     ;;
   setup-git)
     setup_git
+    ;;
+  claude-settings)
+    require_client_id
+    exec "${HELPER_PATH}" claude-settings --client-id "${GH_APP_CLIENT_ID}"
     ;;
   *)
     echo "Error: Unknown command '${cmd}'." >&2

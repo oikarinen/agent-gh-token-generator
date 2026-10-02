@@ -165,7 +165,28 @@ test_passes_status_token_and_logout_to_helper() {
   run_wrapper token
   assert_status 0
   assert_file stdout "ghu_stub_token"
-  assert_file helper.args "$(printf 'status\nlogout\ntoken')"
+  assert_file helper.args "$(printf 'status\nlogout\ntoken --client-id Iv23liTest')"
+}
+
+test_token_without_client_id_is_not_pinned() {
+  cp "${WRAPPER}" "${SANDBOX}/bin/agent-github-token"
+  run_wrapper token
+  assert_status 0
+  assert_file helper.args "token"
+}
+
+test_claude_settings_passes_client_id() {
+  run_wrapper claude-settings
+  assert_status 0
+  assert_file helper.args "claude-settings --client-id Iv23liTest"
+}
+
+test_claude_settings_requires_client_id() {
+  cp "${WRAPPER}" "${SANDBOX}/bin/agent-github-token"
+  run_wrapper claude-settings
+  assert_status 1
+  assert_contains stderr "Set GH_APP_CLIENT_ID"
+  assert_not_called helper
 }
 
 test_propagates_helper_exit_status() {
@@ -178,7 +199,7 @@ test_propagates_helper_exit_status() {
 test_gh_runs_with_fresh_token() {
   run_wrapper gh pr list --repo "owner/repo name"
   assert_status 0
-  assert_file helper.args "token"
+  assert_file helper.args "token --client-id Iv23liTest"
   assert_file gh.token "ghu_stub_token"
   assert_file gh.args "$(printf 'pr\nlist\n--repo\nowner/repo name')"
   assert_not_contains stdout "ghu_stub_token"
@@ -206,7 +227,7 @@ test_setup_git_configures_credential_helper() {
   assert_status 0
   assert_contains git.log "[config][--local][--unset-all][credential.https://github.com.helper]"
   assert_contains git.log "[config][--local][--add][credential.https://github.com.helper][]"
-  assert_contains git.log "[config][--local][--add][credential.https://github.com.helper][!'${SANDBOX}/bin/gh-app-token-generator' git-credential]"
+  assert_contains git.log "[config][--local][--add][credential.https://github.com.helper][!'${SANDBOX}/bin/gh-app-token-generator' git-credential --client-id 'Iv23liTest']"
   assert_contains stdout "git now uses agent-github-token tokens"
   assert_not_contains stderr "Warning"
 }
@@ -233,7 +254,7 @@ test_setup_git_works_with_real_git() {
   git config --global credential.helper '!f() { echo username=global; echo password=global-secret; }; f'
   git init -q "${SANDBOX}/repo"
   helper '
-if [[ "$1 $2" == "git-credential get" ]]; then
+if [[ "$1" == git-credential && "${*: -1}" == get ]]; then
   while read -r line && [[ -n "${line}" ]]; do :; done
   echo username=x-access-token
   echo password=ghu_stub_token

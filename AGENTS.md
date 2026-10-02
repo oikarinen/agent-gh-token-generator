@@ -8,6 +8,7 @@ Start by exploring the repository structure. The key files are:
 
 -   `go.mod`: Defines the Go module and its dependencies.
 -   `cmd/gh-app-token-generator/main.go`: The command-line interface (`login`, `token`, `status`, `logout`, `git-credential`).
+-   `cmd/gh-app-token-generator/claude.go`: Claude Code hooks and settings that confine a session's GitHub access to the App token.
 -   `internal/authtoken/authtoken.go`: Device flow login and automatic token renewal.
 -   `internal/authtoken/github.go`: Calls to GitHub's OAuth endpoints.
 -   `internal/authtoken/keychain.go`: Token storage in the macOS Keychain.

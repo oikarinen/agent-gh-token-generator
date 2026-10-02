@@ -106,6 +106,52 @@ func TestRequestDeviceCode(t *testing.T) {
 	})
 }
 
+func TestUserInstallations(t *testing.T) {
+	t.Run("asks with the token and decodes installations", func(t *testing.T) {
+		var req *http.Request
+		gh := &GitHub{APIBaseURL: "https://api.github.example", Client: handlerClient(jsonHandler(t, &req, nil, http.StatusOK, map[string]any{
+			"total_count":   1,
+			"installations": []map[string]any{{"id": 7, "client_id": "Iv23liTest", "app_slug": "my-agent", "app_id": 42}},
+		}))}
+
+		installations, err := gh.UserInstallations(context.Background(), "ghu_abc")
+		if err != nil {
+			t.Fatalf("Expected no error, got: %v", err)
+		}
+		if len(installations) != 1 || installations[0] != (Installation{ID: 7, ClientID: "Iv23liTest", AppSlug: "my-agent"}) {
+			t.Errorf("Installations = %+v", installations)
+		}
+		if req.Method != http.MethodGet || req.URL.Path != "/user/installations" {
+			t.Errorf("Request = %s %s", req.Method, req.URL)
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer ghu_abc" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if got := req.Header.Get("X-GitHub-Api-Version"); got != "2022-11-28" {
+			t.Errorf("X-GitHub-Api-Version = %q", got)
+		}
+	})
+
+	t.Run("rejected token", func(t *testing.T) {
+		gh := &GitHub{APIBaseURL: "https://api.github.example", Client: handlerClient(jsonHandler(t, nil, nil, http.StatusForbidden,
+			map[string]any{"message": "You must authenticate with an access token authorized to a GitHub App"}))}
+
+		if _, err := gh.UserInstallations(context.Background(), "ghp_classic"); err == nil {
+			t.Fatal("Expected an error, got nil")
+		}
+	})
+
+	t.Run("malformed JSON", func(t *testing.T) {
+		gh := &GitHub{APIBaseURL: "https://api.github.example", Client: handlerClient(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("{not json"))
+		})}
+
+		if _, err := gh.UserInstallations(context.Background(), "ghu_abc"); err == nil {
+			t.Fatal("Expected an error, got nil")
+		}
+	})
+}
+
 func TestTokenRequests(t *testing.T) {
 	success := map[string]any{
 		"access_token":             "ghu_new",

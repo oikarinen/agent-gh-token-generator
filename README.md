@@ -96,7 +96,7 @@ Open the URL shown, enter the code, and approve the App. Check the result with:
 agent-github-token gh pr create --fill
 ```
 
-To make agents use it, tell them to, for example in your `CLAUDE.md` or `AGENTS.md`: "Use `agent-github-token gh` instead of `gh`."
+For Claude Code, see [Claude Code](#claude-code) below: it makes plain `gh` and `git` in Claude's sessions use the App token, without changing your own terminal.
 
 **git:** in the repository the agent works in, run:
 
@@ -109,6 +109,32 @@ git then gets a token from the tool for every `https://github.com` request in th
 **Other tools:** `agent-github-token token` prints a valid token. Use it for a single command, for example `GH_TOKEN="$(agent-github-token token)" some-tool`. Don't keep it around: each renewal invalidates the previous token.
 
 **Logging out:** `agent-github-token logout` removes the tokens from the Keychain. To also revoke the App's access, go to [Settings > Applications > Authorized GitHub Apps](https://github.com/settings/apps/authorizations).
+
+## Claude Code
+
+You can limit Claude Code's GitHub access to this App's token, while your own terminal keeps your personal login.
+
+1.  Log in as described above.
+2.  Print the settings and merge them into your user settings, `~/.claude/settings.json`:
+
+    ```bash
+    agent-github-token claude-settings
+    ```
+
+    They have to go in your user settings: Claude Code ignores credential rules in a repository's settings files.
+3.  Start a new Claude Code session.
+
+What the settings do:
+
+*   **Session start:** a hook puts a `gh` shim first on the `PATH` of Claude's commands. The shim gets a token for your App and runs the real `gh` with it, using a separate `gh` config directory, so `gh` can't fall back to your own login. The hook also points Claude's `git` at this tool for `https://github.com` and rewrites `git@github.com:` remotes to HTTPS. All of this is set through environment variables that only Claude's commands see.
+*   **Before every command:** a second hook blocks commands that reach for other credentials: the Keychain through `security`, `gh auth`, SSH keys, `gh`'s config, other git credential helpers, setting `GH_TOKEN` by hand, or changing how git authenticates. Before commands that talk to GitHub, it renews the token if needed and has GitHub confirm the token belongs to your App's client ID (GitHub is asked once per token). Otherwise the command is blocked with an explanation, such as asking you to log in again.
+*   **Sandbox:** every command runs in Claude Code's sandbox with no unsandboxed fallback. Credential files (`~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.netrc`) and token variables are hidden from it, and the Read tool is denied those files. Network access is limited to GitHub, so add the other domains your work needs. `enableWeakerNetworkIsolation` lets `gh`, which is written in Go, verify TLS certificates inside the sandbox; Claude Code's documentation notes that this opens a potential data exfiltration path through the macOS trust service.
+
+What it can't guarantee:
+
+*   **The Keychain stays reachable.** Sandboxed commands can still query the macOS Keychain. The hook blocks the direct ways in, but a roundabout command, such as a script, could get there. Any other GitHub credential in your login Keychain is therefore within reach, including `gh`'s own login (`gh auth login` stores its token there) and passwords saved by git's osxkeychain helper. For a firm guarantee, keep no other GitHub credentials in the Keychain: log `gh` in with `gh auth login --insecure-storage` so its token lives in `~/.config/gh`, which the sandbox hides, or log it out, and remove `github.com` entries in Keychain Access. The strongest option is to run Claude Code under a separate macOS user.
+*   **Hooks match command text.** They are guardrails against mistakes and casual misuse, not a security boundary. The sandbox is the boundary.
+*   **The App's own tokens are reachable too.** Claude's commands need them, and they only grant the same restricted access.
 
 ## Security Notes
 

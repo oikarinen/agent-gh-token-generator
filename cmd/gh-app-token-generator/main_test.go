@@ -16,15 +16,23 @@ var testNow = time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
 
 // fakeService records calls and returns canned results.
 type fakeService struct {
+	clientID      string // the --client-id the service was created with
 	loginClientID string
 	loginErr      error
 	token         string
 	tokenErr      error
 	tokenCalls    int
+	verifiedErr   error
+	verifiedCalls int
 	status        *authtoken.Status
 	statusErr     error
 	logoutErr     error
 	logoutCalls   int
+}
+
+func (f *fakeService) VerifiedToken(ctx context.Context) (string, error) {
+	f.verifiedCalls++
+	return f.token, f.verifiedErr
 }
 
 func (f *fakeService) Login(ctx context.Context, clientID string, prompt func(string, string)) (*authtoken.Status, error) {
@@ -53,15 +61,35 @@ type result struct {
 	stdout, stderr string
 }
 
-func runCLI(service *fakeService, stdin string, args ...string) result {
+const testHelperPath = "/opt/agent/bin/gh-app-token-generator"
+
+// newTestCLI returns a cli wired to service, with env as its environment
+// and cacheDir as the user cache directory.
+func newTestCLI(service *fakeService, stdin string, env map[string]string, cacheDir string) (*cli, *bytes.Buffer, *bytes.Buffer) {
 	var stdout, stderr bytes.Buffer
 	c := &cli{
-		stdin:      strings.NewReader(stdin),
-		stdout:     &stdout,
-		stderr:     &stderr,
-		newService: func() (tokenService, error) { return service, nil },
+		stdin:  strings.NewReader(stdin),
+		stdout: &stdout,
+		stderr: &stderr,
+		newService: func(clientID string) (tokenService, error) {
+			service.clientID = clientID
+			return service, nil
+		},
 		now:        func() time.Time { return testNow },
+		getenv:     func(name string) string { return env[name] },
+		executable: func() (string, error) { return testHelperPath, nil },
+		cacheDir: func() (string, error) {
+			if cacheDir == "" {
+				return "", errors.New("no cache directory")
+			}
+			return cacheDir, nil
+		},
 	}
+	return c, &stdout, &stderr
+}
+
+func runCLI(service *fakeService, stdin string, args ...string) result {
+	c, stdout, stderr := newTestCLI(service, stdin, nil, "")
 	code := c.run(context.Background(), args)
 	return result{code, stdout.String(), stderr.String()}
 }
@@ -95,15 +123,33 @@ func TestUsage(t *testing.T) {
 }
 
 func TestServiceUnavailable(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	c := &cli{
-		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
-		newService: func() (tokenService, error) { return nil, errors.New("only macOS is supported") },
-		now:        time.Now,
-	}
+	c, _, stderr := newTestCLI(&fakeService{}, "", nil, "")
+	c.newService = func(string) (tokenService, error) { return nil, errors.New("only macOS is supported") }
 	if code := c.run(context.Background(), []string{"token"}); code != 1 || !strings.Contains(stderr.String(), "only macOS") {
 		t.Errorf("code %d, stderr %q", code, stderr.String())
 	}
+}
+
+func TestClientIDOption(t *testing.T) {
+	for _, args := range [][]string{
+		{"token", "--client-id", "Iv23liTest"},
+		{"token", "--client-id=Iv23liTest"},
+	} {
+		service := &fakeService{token: "ghu_abc"}
+		runCLI(service, "", args...).check(t, 0, "ghu_abc")
+		if service.clientID != "Iv23liTest" {
+			t.Errorf("%v: service created with client ID %q", args, service.clientID)
+		}
+	}
+
+	service := &fakeService{token: "ghu_abc"}
+	runCLI(service, "", "token").check(t, 0, "ghu_abc")
+	if service.clientID != "" {
+		t.Errorf("Client ID %q without --client-id", service.clientID)
+	}
+
+	runCLI(&fakeService{}, "", "token", "--client-id").check(t, 1, "", "--client-id needs a value")
+	runCLI(&fakeService{}, "", "token", "--client-id=").check(t, 1, "", "--client-id needs a value")
 }
 
 func TestLogin(t *testing.T) {

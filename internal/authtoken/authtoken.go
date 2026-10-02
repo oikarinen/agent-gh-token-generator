@@ -10,6 +10,8 @@ package authtoken
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,6 +19,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -33,6 +36,9 @@ var (
 	// expire, so there is no refresh token to renew them with.
 	ErrExpirationDisabled = errors.New("the GitHub App issues user tokens that never expire; turn on " +
 		"\"User-to-server token expiration\" under the App's Optional features and log in again")
+	// ErrClientIDMismatch means the stored tokens belong to a different App
+	// than the one expected.
+	ErrClientIDMismatch = errors.New("the stored login is for a different GitHub App")
 )
 
 // clientIDPattern matches GitHub App client IDs such as "Iv23liAbCdEf0123".
@@ -69,7 +75,12 @@ type Manager struct {
 	GitHub   *GitHub
 	Store    Store
 	LockPath string
-	Now      func() time.Time
+	// ClientID, if set, is the only GitHub App whose tokens are handed out.
+	ClientID string
+	// VerifiedPath records the hash of the last access token GitHub
+	// confirmed belongs to the App, so each token is checked only once.
+	VerifiedPath string
+	Now          func() time.Time
 	// Wait pauses between device flow polls. It returns early with the
 	// context's error if the context ends.
 	Wait func(ctx context.Context, d time.Duration) error
@@ -85,11 +96,16 @@ func New() (*Manager, error) {
 		return nil, err
 	}
 	return &Manager{
-		GitHub:   &GitHub{BaseURL: "https://github.com", Client: &http.Client{Timeout: 30 * time.Second}},
-		Store:    NewKeychainStore(),
-		LockPath: filepath.Join(cacheDir, "agent-github-token", "token.lock"),
-		Now:      time.Now,
-		Wait:     wait,
+		GitHub: &GitHub{
+			BaseURL:    "https://github.com",
+			APIBaseURL: "https://api.github.com",
+			Client:     &http.Client{Timeout: 30 * time.Second},
+		},
+		Store:        NewKeychainStore(),
+		LockPath:     filepath.Join(cacheDir, "agent-github-token", "token.lock"),
+		VerifiedPath: filepath.Join(cacheDir, "agent-github-token", "verified-token"),
+		Now:          time.Now,
+		Wait:         wait,
 	}, nil
 }
 
@@ -143,6 +159,11 @@ func (m *Manager) Login(ctx context.Context, clientID string, prompt func(userCo
 			if err != nil {
 				return nil, err
 			}
+			// Have GitHub confirm the token belongs to this App and that the
+			// App is installed somewhere, before anything relies on it.
+			if err := m.verify(ctx, tokens, clientID, true); err != nil {
+				return nil, err
+			}
 			if err := m.save(tokens); err != nil {
 				return nil, err
 			}
@@ -162,28 +183,56 @@ func (m *Manager) Login(ctx context.Context, clientID string, prompt func(userCo
 }
 
 // Token returns a valid access token, renewing it first if it expires within
-// refreshMargin.
+// refreshMargin. If m.ClientID is set, it refuses tokens of any other App.
 func (m *Manager) Token(ctx context.Context) (string, error) {
-	tokens, err := m.Store.Load()
+	tokens, err := m.tokens(ctx)
 	if err != nil {
 		return "", err
 	}
+	return tokens.AccessToken, nil
+}
+
+// VerifiedToken is like Token, but also has GitHub confirm that the token
+// belongs to the App with m.ClientID (or, if unset, the stored client ID).
+// GitHub is asked once per access token; the answer is remembered by hash.
+func (m *Manager) VerifiedToken(ctx context.Context) (string, error) {
+	tokens, err := m.tokens(ctx)
+	if err != nil {
+		return "", err
+	}
+	clientID := m.ClientID
+	if clientID == "" {
+		clientID = tokens.ClientID
+	}
+	if !m.verified(tokens.AccessToken) {
+		if err := m.verify(ctx, tokens, clientID, false); err != nil {
+			return "", err
+		}
+	}
+	return tokens.AccessToken, nil
+}
+
+func (m *Manager) tokens(ctx context.Context) (*Tokens, error) {
+	tokens, err := m.load()
+	if err != nil {
+		return nil, err
+	}
 	if m.fresh(tokens) {
-		return tokens.AccessToken, nil
+		return tokens, nil
 	}
 
 	defer m.lock()()
 
 	// Another process may have renewed the token while we waited for the lock.
-	tokens, err = m.Store.Load()
+	tokens, err = m.load()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if m.fresh(tokens) {
-		return tokens.AccessToken, nil
+		return tokens, nil
 	}
 	if !m.Now().Before(tokens.RefreshTokenExpiresAt) {
-		return "", ErrLoginExpired
+		return nil, ErrLoginExpired
 	}
 
 	requestedAt := m.Now()
@@ -193,23 +242,87 @@ func (m *Manager) Token(ctx context.Context) (string, error) {
 		if errors.As(err, &oauthErr) && oauthErr.Code == "bad_refresh_token" {
 			// If another process renewed first (possible when the lock is
 			// unavailable), our refresh token is spent but its tokens are stored.
-			if current, loadErr := m.Store.Load(); loadErr == nil &&
+			if current, loadErr := m.load(); loadErr == nil &&
 				current.RefreshToken != tokens.RefreshToken && m.fresh(current) {
-				return current.AccessToken, nil
+				return current, nil
 			}
-			return "", fmt.Errorf("%w: %v", ErrLoginExpired, err)
+			return nil, fmt.Errorf("%w: %v", ErrLoginExpired, err)
 		}
-		return "", fmt.Errorf("renewing the access token: %w", err)
+		return nil, fmt.Errorf("renewing the access token: %w", err)
 	}
+	// GitHub only accepts the refresh token together with the client ID it
+	// was issued for, so the renewed tokens belong to the same App.
 	renewed, err := newTokens(tokens.ClientID, resp, requestedAt)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if err := m.Store.Save(renewed); err != nil {
 		// GitHub has already invalidated the old tokens, so a new login is needed.
-		return "", fmt.Errorf("storing the renewed tokens failed; run login again: %w", err)
+		return nil, fmt.Errorf("storing the renewed tokens failed; run login again: %w", err)
 	}
-	return renewed.AccessToken, nil
+	return renewed, nil
+}
+
+// load reads the stored tokens and checks they belong to m.ClientID, if set.
+func (m *Manager) load() (*Tokens, error) {
+	tokens, err := m.Store.Load()
+	if err != nil {
+		return nil, err
+	}
+	if m.ClientID != "" && tokens.ClientID != m.ClientID {
+		return nil, fmt.Errorf("%w: it is for client ID %q, but %q is expected; run login again",
+			ErrClientIDMismatch, tokens.ClientID, m.ClientID)
+	}
+	return tokens, nil
+}
+
+// verify asks GitHub which App the access token belongs to. GitHub lists only
+// installations of the App that issued the token, so every installation must
+// carry clientID. At login, requireInstallation also insists on at least one,
+// since a token for an App that is installed nowhere can't reach anything.
+func (m *Manager) verify(ctx context.Context, tokens *Tokens, clientID string, requireInstallation bool) error {
+	installations, err := m.GitHub.UserInstallations(ctx, tokens.AccessToken)
+	if err != nil {
+		return fmt.Errorf("checking the token with GitHub: %w", err)
+	}
+	if requireInstallation && len(installations) == 0 {
+		return errors.New("the GitHub App is not installed on any account you can access; " +
+			"install it on the repositories the agent may use, then log in again")
+	}
+	for _, installation := range installations {
+		if installation.ClientID != clientID {
+			return fmt.Errorf("%w: GitHub reports the token belongs to App %q (client ID %q), not client ID %q",
+				ErrClientIDMismatch, installation.AppSlug, installation.ClientID, clientID)
+		}
+	}
+	m.markVerified(tokens.AccessToken)
+	return nil
+}
+
+// verified reports whether GitHub already confirmed accessToken.
+func (m *Manager) verified(accessToken string) bool {
+	if m.VerifiedPath == "" {
+		return false
+	}
+	data, err := os.ReadFile(m.VerifiedPath)
+	return err == nil && strings.TrimSpace(string(data)) == tokenHash(accessToken)
+}
+
+// markVerified remembers that GitHub confirmed accessToken. It is best
+// effort: if the file can't be written, the token is simply checked again.
+func (m *Manager) markVerified(accessToken string) {
+	if m.VerifiedPath == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(m.VerifiedPath), 0o700); err != nil {
+		return
+	}
+	_ = os.WriteFile(m.VerifiedPath, []byte(tokenHash(accessToken)+"\n"), 0o600)
+}
+
+func tokenHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 // Status describes the stored login.

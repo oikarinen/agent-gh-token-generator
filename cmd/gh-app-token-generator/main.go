@@ -14,14 +14,18 @@ import (
 	"github.com/oikarinen/agent-gh-token-generator/internal/authtoken"
 )
 
-const usage = `Usage: gh-app-token-generator <command>
+const usage = `Usage: gh-app-token-generator <command> [--client-id ID]
 
 Commands:
-  login <client-id>   Authorize with GitHub's device flow and store the tokens in the Keychain
-  token               Print a valid access token, renewing it first if needed
-  status              Show when the stored tokens expire
-  logout              Remove the stored tokens from the Keychain
-  git-credential get  Act as a git credential helper for https://github.com
+  login <client-id>          Authorize with GitHub's device flow and store the tokens in the Keychain
+  token                      Print a valid access token, renewing it first if needed
+  status                     Show when the stored tokens expire
+  logout                     Remove the stored tokens from the Keychain
+  git-credential get         Act as a git credential helper for https://github.com
+  claude-hook <event>        Run a Claude Code hook (session-start or pre-tool-use); needs --client-id
+  claude-settings            Print Claude Code settings that install the hooks; needs --client-id
+
+With --client-id, only tokens issued for that GitHub App are handed out.
 `
 
 // loginHint is shown when a new device flow login is needed.
@@ -31,6 +35,7 @@ const loginHint = "run 'agent-github-token login' to authorize in the browser"
 type tokenService interface {
 	Login(ctx context.Context, clientID string, prompt func(userCode, verificationURI string)) (*authtoken.Status, error)
 	Token(ctx context.Context) (string, error)
+	VerifiedToken(ctx context.Context) (string, error)
 	Status() (*authtoken.Status, error)
 	Logout() error
 }
@@ -38,18 +43,33 @@ type tokenService interface {
 type cli struct {
 	stdin          io.Reader
 	stdout, stderr io.Writer
-	newService     func() (tokenService, error)
-	now            func() time.Time
+	// newService returns the token service; with a non-empty clientID it
+	// only hands out tokens issued for that GitHub App.
+	newService func(clientID string) (tokenService, error)
+	now        func() time.Time
+	getenv     func(string) string
+	executable func() (string, error)
+	cacheDir   func() (string, error)
 }
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	c := &cli{
-		stdin:      os.Stdin,
-		stdout:     os.Stdout,
-		stderr:     os.Stderr,
-		newService: func() (tokenService, error) { return authtoken.New() },
+		stdin:  os.Stdin,
+		stdout: os.Stdout,
+		stderr: os.Stderr,
+		newService: func(clientID string) (tokenService, error) {
+			m, err := authtoken.New()
+			if err != nil {
+				return nil, err
+			}
+			m.ClientID = clientID
+			return m, nil
+		},
 		now:        time.Now,
+		getenv:     os.Getenv,
+		executable: os.Executable,
+		cacheDir:   os.UserCacheDir,
 	}
 	code := c.run(ctx, os.Args[1:])
 	stop()
@@ -63,33 +83,41 @@ func (c *cli) run(ctx context.Context, args []string) int {
 		fmt.Fprint(c.stderr, usage)
 		return 1
 	}
-	command, args := args[0], args[1:]
-
-	switch command {
-	case "help", "-h", "--help":
-		fmt.Fprint(c.stdout, usage)
-		return 0
-	case "login":
-		if len(args) != 1 {
-			fmt.Fprint(c.stderr, usage)
-			return 1
+	command := args[0]
+	clientID, args, err := parseArgs(args[1:])
+	if err != nil {
+		fmt.Fprintf(c.stderr, "%v\n\n%s", err, usage)
+		if command == "claude-hook" {
+			return 2 // a misconfigured hook blocks rather than letting commands through
 		}
-	case "token", "status", "logout":
-		if len(args) != 0 {
-			fmt.Fprint(c.stderr, usage)
-			return 1
-		}
-	case "git-credential":
-		if len(args) != 1 {
-			fmt.Fprint(c.stderr, usage)
-			return 1
-		}
-	default:
-		fmt.Fprintf(c.stderr, "Unknown command %q\n\n%s", command, usage)
 		return 1
 	}
 
-	service, err := c.newService()
+	wantArgs := map[string]int{"login": 1, "token": 0, "status": 0, "logout": 0, "git-credential": 1, "claude-hook": 1, "claude-settings": 0}
+	switch n, known := wantArgs[command]; {
+	case command == "help" || command == "-h" || command == "--help":
+		fmt.Fprint(c.stdout, usage)
+		return 0
+	case !known:
+		fmt.Fprintf(c.stderr, "Unknown command %q\n\n%s", command, usage)
+		return 1
+	case len(args) != n:
+		fmt.Fprint(c.stderr, usage)
+		return 1
+	}
+
+	// The Claude Code commands create the token service only when needed.
+	switch command {
+	case "claude-hook":
+		return c.claudeHook(ctx, args[0], clientID)
+	case "claude-settings":
+		if clientID == "" {
+			return c.fail(errors.New("claude-settings needs --client-id"))
+		}
+		return c.claudeSettings(clientID)
+	}
+
+	service, err := c.newService(clientID)
 	if err != nil {
 		return c.fail(err)
 	}
@@ -106,6 +134,28 @@ func (c *cli) run(ctx context.Context, args []string) int {
 	default:
 		return c.gitCredential(ctx, service, args[0])
 	}
+}
+
+// parseArgs separates the --client-id option from positional arguments.
+func parseArgs(args []string) (clientID string, positional []string, err error) {
+	for i := 0; i < len(args); i++ {
+		switch arg := args[i]; {
+		case arg == "--client-id":
+			if i+1 >= len(args) || args[i+1] == "" {
+				return "", nil, errors.New("--client-id needs a value")
+			}
+			clientID = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "--client-id="):
+			clientID = strings.TrimPrefix(arg, "--client-id=")
+			if clientID == "" {
+				return "", nil, errors.New("--client-id needs a value")
+			}
+		default:
+			positional = append(positional, arg)
+		}
+	}
+	return clientID, positional, nil
 }
 
 func (c *cli) login(ctx context.Context, service tokenService, clientID string) int {

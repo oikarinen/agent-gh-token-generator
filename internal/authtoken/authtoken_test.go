@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -64,6 +65,12 @@ type fakeGitHub struct {
 	onRefresh    func()        // runs while a refresh request is in flight
 	requests     int
 	refreshForms []url.Values
+
+	// installations is the /user/installations response; nil means one
+	// installation of the App with client ID "Iv23liTest".
+	installations     []Installation
+	installationCalls int
+	installationAuth  string
 }
 
 func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -76,6 +83,14 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var delay time.Duration
 	var hook func()
 	switch {
+	case r.URL.Path == "/user/installations":
+		f.installationCalls++
+		f.installationAuth = r.Header.Get("Authorization")
+		installations := f.installations
+		if installations == nil {
+			installations = []Installation{{ID: 1, ClientID: "Iv23liTest", AppSlug: "my-agent"}}
+		}
+		body = map[string]any{"total_count": len(installations), "installations": installations}
 	case r.URL.Path == "/login/device/code":
 		body = f.deviceCode
 	case r.PostForm.Get("grant_type") == "refresh_token":
@@ -125,11 +140,17 @@ type testEnv struct {
 
 func newTestEnv(t *testing.T) *testEnv {
 	env := &testEnv{store: &memStore{}, github: &fakeGitHub{t: t}}
+	dir := t.TempDir()
 	env.manager = &Manager{
-		GitHub:   &GitHub{BaseURL: "https://github.example", Client: handlerClient(env.github.ServeHTTP)},
-		Store:    env.store,
-		LockPath: filepath.Join(t.TempDir(), "token.lock"),
-		Now:      func() time.Time { return testNow },
+		GitHub: &GitHub{
+			BaseURL:    "https://github.example",
+			APIBaseURL: "https://api.github.example",
+			Client:     handlerClient(env.github.ServeHTTP),
+		},
+		Store:        env.store,
+		LockPath:     filepath.Join(dir, "token.lock"),
+		VerifiedPath: filepath.Join(dir, "verified-token"),
+		Now:          func() time.Time { return testNow },
 		Wait: func(ctx context.Context, d time.Duration) error {
 			env.waits = append(env.waits, d)
 			return ctx.Err()
@@ -189,7 +210,36 @@ func TestLogin(t *testing.T) {
 		if status.LoginExpiresAt != want.RefreshTokenExpiresAt || status.AccessTokenExpiresAt != want.AccessTokenExpiresAt {
 			t.Errorf("Status = %+v", status)
 		}
+		if env.github.installationCalls != 1 || env.github.installationAuth != "Bearer ghu_new" {
+			t.Errorf("GitHub was not asked to confirm the new token: %d calls, auth %q",
+				env.github.installationCalls, env.github.installationAuth)
+		}
 	})
+
+	for _, tt := range []struct {
+		name          string
+		installations []Installation
+		wantErr       error
+		wantText      string
+	}{
+		{"token belongs to another App", []Installation{{ClientID: "Iv23liOther", AppSlug: "other-app"}}, ErrClientIDMismatch, "other-app"},
+		{"App not installed anywhere", []Installation{}, nil, "not installed"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newTestEnv(t)
+			env.github.deviceCode = deviceCodeOK
+			env.github.polls = []any{tokensOK}
+			env.github.installations = tt.installations
+
+			_, err := env.manager.Login(context.Background(), "Iv23liTest", func(string, string) {})
+			if err == nil || !strings.Contains(err.Error(), tt.wantText) || (tt.wantErr != nil && !errors.Is(err, tt.wantErr)) {
+				t.Fatalf("Expected error containing %q, got: %v", tt.wantText, err)
+			}
+			if env.store.tokens != nil {
+				t.Error("Tokens were stored after a failed check")
+			}
+		})
+	}
 
 	t.Run("slow_down without an interval adds 5 seconds", func(t *testing.T) {
 		env := newTestEnv(t)
@@ -429,6 +479,90 @@ func TestToken(t *testing.T) {
 		}
 		if n := len(env.github.refreshForms); n != 1 {
 			t.Errorf("Refresh requests = %d, want 1", n)
+		}
+	})
+}
+
+func TestClientIDPin(t *testing.T) {
+	t.Run("hands out tokens of the expected App", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.manager.ClientID = "Iv23liTest"
+		env.store.tokens = storedTokens(2 * time.Hour)
+
+		if token, err := env.manager.Token(context.Background()); err != nil || token != "ghu_old" {
+			t.Fatalf("Token() = %q, %v; want ghu_old", token, err)
+		}
+	})
+
+	for _, accessLeft := range []time.Duration{2 * time.Hour, time.Minute} {
+		t.Run(fmt.Sprintf("refuses another App's tokens with %v left", accessLeft), func(t *testing.T) {
+			env := newTestEnv(t)
+			env.manager.ClientID = "Iv23liExpected"
+			env.store.tokens = storedTokens(accessLeft)
+			env.github.refresh = tokensOK
+
+			_, err := env.manager.Token(context.Background())
+			if !errors.Is(err, ErrClientIDMismatch) {
+				t.Fatalf("Expected ErrClientIDMismatch, got: %v", err)
+			}
+			if env.github.requests != 0 {
+				t.Error("GitHub was called for another App's tokens")
+			}
+		})
+	}
+}
+
+func TestVerifiedToken(t *testing.T) {
+	t.Run("asks GitHub once per token", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.manager.ClientID = "Iv23liTest"
+		env.store.tokens = storedTokens(2 * time.Hour)
+
+		for i := 0; i < 3; i++ {
+			if token, err := env.manager.VerifiedToken(context.Background()); err != nil || token != "ghu_old" {
+				t.Fatalf("VerifiedToken() = %q, %v; want ghu_old", token, err)
+			}
+		}
+		if env.github.installationCalls != 1 || env.github.installationAuth != "Bearer ghu_old" {
+			t.Errorf("Installation checks = %d (auth %q), want 1 with the stored token",
+				env.github.installationCalls, env.github.installationAuth)
+		}
+
+		// A renewed token is checked again.
+		env.store.tokens = storedTokens(time.Minute)
+		env.github.refresh = tokensOK
+		if token, err := env.manager.VerifiedToken(context.Background()); err != nil || token != "ghu_new" {
+			t.Fatalf("VerifiedToken() after renewal = %q, %v; want ghu_new", token, err)
+		}
+		if env.github.installationCalls != 2 || env.github.installationAuth != "Bearer ghu_new" {
+			t.Errorf("Renewed token was not checked: %d calls, auth %q", env.github.installationCalls, env.github.installationAuth)
+		}
+	})
+
+	t.Run("refuses a token GitHub attributes to another App", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.store.tokens = storedTokens(2 * time.Hour)
+		env.github.installations = []Installation{{ClientID: "Iv23liOther", AppSlug: "other-app"}}
+
+		for i := 0; i < 2; i++ {
+			if _, err := env.manager.VerifiedToken(context.Background()); !errors.Is(err, ErrClientIDMismatch) {
+				t.Fatalf("Expected ErrClientIDMismatch, got: %v", err)
+			}
+		}
+		if env.github.installationCalls != 2 {
+			t.Errorf("A refused token was remembered as verified (%d checks, want 2)", env.github.installationCalls)
+		}
+	})
+
+	t.Run("GitHub unreachable", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.store.tokens = storedTokens(2 * time.Hour)
+		env.manager.GitHub.Client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("connection refused")
+		})}
+
+		if _, err := env.manager.VerifiedToken(context.Background()); err == nil {
+			t.Fatal("Expected an error, got nil")
 		}
 	})
 }
