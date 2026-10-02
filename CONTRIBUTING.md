@@ -26,7 +26,7 @@ go build -o bin/gh-app-token-generator ./cmd/gh-app-token-generator
 To run the test suite, use the `go test` command:
 
 ```sh
-go test -v ./...
+go test -race -v ./...
 ```
 
 ### Linting
