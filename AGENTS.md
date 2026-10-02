@@ -7,9 +7,12 @@ This section provides specific guidance for an AI assistant like Gemini or Claud
 Start by exploring the repository structure. The key files are:
 
 -   `go.mod`: Defines the Go module and its dependencies.
--   `cmd/gh-app-token-generator/main.go`: The main entry point of the application.
--   `internal/authtoken/authtoken.go`: Contains the core logic for generating the GitHub App token.
+-   `cmd/gh-app-token-generator/main.go`: The command-line interface (`login`, `token`, `status`, `logout`, `git-credential`).
+-   `internal/authtoken/authtoken.go`: Device flow login and automatic token renewal.
+-   `internal/authtoken/github.go`: Calls to GitHub's OAuth endpoints.
+-   `internal/authtoken/keychain.go`: Token storage in the macOS Keychain.
 -   `bin/agent-github-token`: The user-facing shell script wrapper.
+-   `test/agent-github-token_test.sh`: Tests for the wrapper script.
 
 Use `list_directory` and `read_file` to understand the contents of these files.
 
@@ -52,28 +55,17 @@ Here’s a hypothetical example of how an AI assistant could add a `--version` f
 In `main.go`, add a check for the `--version` flag.
 
 ```go
-package main
-
-import (
-	"fmt"
-	"os"
-
-	"github.com/oikarinen/agent-gh-token-generator/internal/authtoken"
-)
-
 var version = "dev" // Can be set during build
 
-func main() {
-	if len(os.Args) > 1 && os.Args[1] == "--version" {
-		fmt.Println(version)
-		os.Exit(0)
-	}
+func (c *cli) run(ctx context.Context, args []string) int {
+	// ... argument count check
 
-	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "Usage: ", os.Args[0], " <app_id> <installation_id>")
-		os.Exit(1)
-	}
-    // ... rest of the code
+	switch command {
+	case "--version":
+		fmt.Fprintln(c.stdout, version)
+		return 0
+	case "help", "-h", "--help":
+	// ... rest of the code
 ```
 Use `replace` to apply this change.
 

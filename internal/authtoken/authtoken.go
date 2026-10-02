@@ -1,146 +1,290 @@
+// Package authtoken gets GitHub App user access tokens through GitHub's
+// device flow, keeps them in the macOS Keychain, and renews the short-lived
+// access token with the refresh token when it is about to expire.
+//
+// The user authorizes once in the browser. After that, access tokens (valid
+// for 8 hours) are renewed automatically. Each renewal also replaces the
+// refresh token (valid for 6 months), so the browser step only has to be
+// repeated if the tool goes unused for 6 months or the authorization is revoked.
 package authtoken
 
 import (
-	"bytes"
-	"crypto/rsa"
-	"encoding/base64"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"os/exec"
+	"os"
+	"path/filepath"
+	"regexp"
 	"runtime"
-	"strconv"
 	"time"
-
-	"github.com/golang-jwt/jwt/v4"
 )
 
-// The structure of the JSON response from GitHub API
-type InstallationToken struct {
-	Token *string `json:"token"`
+// refreshMargin is how long before expiry an access token is renewed, so a
+// token handed out has time to finish the command it is used for.
+const refreshMargin = 10 * time.Minute
+
+var (
+	// ErrNotLoggedIn means no tokens are stored.
+	ErrNotLoggedIn = errors.New("not logged in")
+	// ErrLoginExpired means the refresh token expired or was revoked.
+	ErrLoginExpired = errors.New("login expired")
+	// ErrExpirationDisabled means the App issues user tokens that never
+	// expire, so there is no refresh token to renew them with.
+	ErrExpirationDisabled = errors.New("the GitHub App issues user tokens that never expire; turn on " +
+		"\"User-to-server token expiration\" under the App's Optional features and log in again")
+)
+
+// clientIDPattern matches GitHub App client IDs such as "Iv23liAbCdEf0123".
+var clientIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// Tokens are the credentials kept between runs.
+type Tokens struct {
+	ClientID              string    `json:"client_id"`
+	AccessToken           string    `json:"access_token"`
+	AccessTokenExpiresAt  time.Time `json:"access_token_expires_at"`
+	RefreshToken          string    `json:"refresh_token"`
+	RefreshTokenExpiresAt time.Time `json:"refresh_token_expires_at"`
 }
 
-// GetToken generates and returns a GitHub App installation access token.
-func GetToken(appID, installationID string) (string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	return getToken(appID, installationID, getPrivateKeyFromKeychain, client, "https://api.github.com")
+// Status describes the stored login without exposing the tokens.
+type Status struct {
+	ClientID             string
+	AccessTokenExpiresAt time.Time
+	LoginExpiresAt       time.Time // when the refresh token expires
 }
 
-// getToken implements GetToken with its dependencies passed in, so tests can
-// supply a key and a fake GitHub API.
-func getToken(appID, installationID string, readKey func() ([]byte, error), client *http.Client, baseURL string) (string, error) {
-	if _, err := strconv.ParseInt(appID, 10, 64); err != nil {
-		return "", fmt.Errorf("invalid app ID: %s", appID)
-	}
-
-	// Fetch the private key from macOS Keychain
-	keyBytes, err := readKey()
-	if err != nil {
-		return "", fmt.Errorf("error fetching private key from keychain: %w", err)
-	}
-
-	// Parse the RSA private key from the PEM format
-	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(keyBytes)
-	if err != nil {
-		return "", fmt.Errorf("error parsing RSA private key: %w", err)
-	}
-
-	// Generate the JWT
-	signedToken, err := createJWT(appID, privateKey)
-	if err != nil {
-		return "", fmt.Errorf("error creating JWT: %w", err)
-	}
-
-	// Get the installation access token from GitHub API
-	accessToken, err := getInstallationAccessToken(client, baseURL, installationID, signedToken)
-	if err != nil {
-		return "", fmt.Errorf("error getting installation access token: %w", err)
-	}
-
-	return *accessToken, nil
+// Store keeps Tokens between runs.
+type Store interface {
+	// Load returns ErrNotLoggedIn if nothing is stored.
+	Load() (*Tokens, error)
+	Save(*Tokens) error
+	// Delete returns ErrNotLoggedIn if nothing is stored.
+	Delete() error
 }
 
-// getPrivateKeyFromKeychain retrieves the GitHub App private key from the macOS Keychain.
-func getPrivateKeyFromKeychain() ([]byte, error) {
+// Manager runs the device flow and hands out access tokens, renewing them
+// when needed.
+type Manager struct {
+	GitHub   *GitHub
+	Store    Store
+	LockPath string
+	Now      func() time.Time
+	// Wait pauses between device flow polls. It returns early with the
+	// context's error if the context ends.
+	Wait func(ctx context.Context, d time.Duration) error
+}
+
+// New returns a Manager that uses github.com and the macOS Keychain.
+func New() (*Manager, error) {
 	if runtime.GOOS != "darwin" {
-		return nil, fmt.Errorf("private key retrieval from keychain is only supported on macOS")
+		return nil, errors.New("only macOS is supported: tokens are stored in the macOS Keychain")
 	}
-	cmd := exec.Command("security", "find-generic-password", "-a", "GH_APP_PRIVATE_KEY", "-s", "agent-github-token", "-w")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("keychain command failed: %w", err)
-	}
-	return decodeKeychainKey(output)
-}
-
-// decodeKeychainKey decodes the base64-encoded PEM key stored in the Keychain.
-func decodeKeychainKey(output []byte) ([]byte, error) {
-	if len(output) == 0 {
-		return nil, fmt.Errorf("private key not found in keychain")
-	}
-
-	// Remove any embedded newlines, as base64.StdEncoding.DecodeString does not tolerate them.
-	cleanedOutput := bytes.ReplaceAll(output, []byte("\n"), nil)
-	cleanedOutput = bytes.ReplaceAll(cleanedOutput, []byte("\r"), nil)
-
-	decoded, err := base64.StdEncoding.DecodeString(string(cleanedOutput))
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode base64 private key from keychain: %w", err)
-	}
-	return decoded, nil
-}
-
-// createJWT creates and signs a new JWT for authenticating as a GitHub App.
-func createJWT(appID string, privateKey *rsa.PrivateKey) (string, error) {
-	claims := jwt.RegisteredClaims{
-		IssuedAt:  jwt.NewNumericDate(time.Now().Add(-60 * time.Second)),
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(10 * time.Minute)),
-		Issuer:    appID,
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	return token.SignedString(privateKey)
-}
-
-// getInstallationAccessToken uses the JWT to request an installation access token from GitHub.
-func getInstallationAccessToken(client *http.Client, baseURL, installationID, jwtToken string) (*string, error) {
-	// Validate that installationID is a number to prevent theoretical SSRF
-	if _, err := strconv.ParseInt(installationID, 10, 64); err != nil {
-		return nil, fmt.Errorf("invalid installation ID: %s", installationID)
-	}
-
-	url := fmt.Sprintf("%s/app/installations/%s/access_tokens", baseURL, installationID)
-
-	req, err := http.NewRequest("POST", url, nil)
+	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return nil, err
 	}
+	return &Manager{
+		GitHub:   &GitHub{BaseURL: "https://github.com", Client: &http.Client{Timeout: 30 * time.Second}},
+		Store:    NewKeychainStore(),
+		LockPath: filepath.Join(cacheDir, "agent-github-token", "token.lock"),
+		Now:      time.Now,
+		Wait:     wait,
+	}, nil
+}
 
-	req.Header.Set("Authorization", "Bearer "+jwtToken)
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("User-Agent", "github-app-authtoken-client/1.0")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+func wait(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
-	resp, err := client.Do(req)
+// Login runs the device flow for the GitHub App with clientID and stores the
+// resulting tokens. prompt is called with the code the user has to enter at
+// verificationURI.
+func (m *Manager) Login(ctx context.Context, clientID string, prompt func(userCode, verificationURI string)) (*Status, error) {
+	if !clientIDPattern.MatchString(clientID) {
+		return nil, fmt.Errorf("invalid client ID %q: use the Client ID from the GitHub App's settings page (not the App ID)", clientID)
+	}
+
+	dc, err := m.GitHub.RequestDeviceCode(ctx, clientID)
+	if err != nil {
+		return nil, fmt.Errorf("starting the device flow: %w", explainOAuthError(err))
+	}
+	prompt(dc.UserCode, dc.VerificationURI)
+
+	expiresIn := time.Duration(dc.ExpiresIn) * time.Second
+	if expiresIn <= 0 {
+		expiresIn = 15 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(ctx, expiresIn)
+	defer cancel()
+
+	interval := time.Duration(dc.Interval) * time.Second
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+
+	for {
+		if err := m.Wait(ctx, interval); err != nil {
+			return nil, fmt.Errorf("the code was not entered in time; run login again: %w", err)
+		}
+		requestedAt := m.Now()
+		resp, err := m.GitHub.PollDeviceToken(ctx, clientID, dc.DeviceCode)
+		var oauthErr *OAuthError
+		switch {
+		case err == nil:
+			tokens, err := newTokens(clientID, resp, requestedAt)
+			if err != nil {
+				return nil, err
+			}
+			if err := m.save(tokens); err != nil {
+				return nil, err
+			}
+			return tokens.status(), nil
+		case errors.As(err, &oauthErr) && oauthErr.Code == "authorization_pending":
+			continue
+		case errors.As(err, &oauthErr) && oauthErr.Code == "slow_down":
+			if oauthErr.Interval > 0 {
+				interval = time.Duration(oauthErr.Interval) * time.Second
+			} else {
+				interval += 5 * time.Second
+			}
+		default:
+			return nil, fmt.Errorf("waiting for authorization: %w", explainOAuthError(err))
+		}
+	}
+}
+
+// Token returns a valid access token, renewing it first if it expires within
+// refreshMargin.
+func (m *Manager) Token(ctx context.Context) (string, error) {
+	tokens, err := m.Store.Load()
+	if err != nil {
+		return "", err
+	}
+	if m.fresh(tokens) {
+		return tokens.AccessToken, nil
+	}
+
+	defer m.lock()()
+
+	// Another process may have renewed the token while we waited for the lock.
+	tokens, err = m.Store.Load()
+	if err != nil {
+		return "", err
+	}
+	if m.fresh(tokens) {
+		return tokens.AccessToken, nil
+	}
+	if !m.Now().Before(tokens.RefreshTokenExpiresAt) {
+		return "", ErrLoginExpired
+	}
+
+	requestedAt := m.Now()
+	resp, err := m.GitHub.RefreshToken(ctx, tokens.ClientID, tokens.RefreshToken)
+	if err != nil {
+		var oauthErr *OAuthError
+		if errors.As(err, &oauthErr) && oauthErr.Code == "bad_refresh_token" {
+			// If another process renewed first (possible when the lock is
+			// unavailable), our refresh token is spent but its tokens are stored.
+			if current, loadErr := m.Store.Load(); loadErr == nil &&
+				current.RefreshToken != tokens.RefreshToken && m.fresh(current) {
+				return current.AccessToken, nil
+			}
+			return "", fmt.Errorf("%w: %v", ErrLoginExpired, err)
+		}
+		return "", fmt.Errorf("renewing the access token: %w", err)
+	}
+	renewed, err := newTokens(tokens.ClientID, resp, requestedAt)
+	if err != nil {
+		return "", err
+	}
+	if err := m.Store.Save(renewed); err != nil {
+		// GitHub has already invalidated the old tokens, so a new login is needed.
+		return "", fmt.Errorf("storing the renewed tokens failed; run login again: %w", err)
+	}
+	return renewed.AccessToken, nil
+}
+
+// Status describes the stored login.
+func (m *Manager) Status() (*Status, error) {
+	tokens, err := m.Store.Load()
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	return tokens.status(), nil
+}
 
-	if resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("received non-201 status code: %d (%s) - Body: %s", resp.StatusCode, resp.Status, string(body))
+// Logout removes the stored tokens. It does not revoke the authorization on
+// GitHub, which needs the App's client secret.
+func (m *Manager) Logout() error {
+	defer m.lock()()
+	return m.Store.Delete()
+}
+
+func (m *Manager) save(tokens *Tokens) error {
+	defer m.lock()()
+	return m.Store.Save(tokens)
+}
+
+// lock takes the refresh lock and returns the function that releases it. The
+// lock is best effort: where the lock file cannot be created (for example in
+// a sandbox that only allows writes to the working directory), it carries on
+// without it rather than failing.
+func (m *Manager) lock() (unlock func()) {
+	unlock, err := lockFile(m.LockPath)
+	if err != nil {
+		return func() {}
 	}
+	return unlock
+}
 
-	var it InstallationToken
-	if err := json.NewDecoder(resp.Body).Decode(&it); err != nil {
-		return nil, err
+func (m *Manager) fresh(tokens *Tokens) bool {
+	return m.Now().Add(refreshMargin).Before(tokens.AccessTokenExpiresAt)
+}
+
+func newTokens(clientID string, resp *tokenResponse, requestedAt time.Time) (*Tokens, error) {
+	if resp.RefreshToken == "" || resp.ExpiresIn <= 0 || resp.RefreshTokenExpiresIn <= 0 {
+		return nil, ErrExpirationDisabled
 	}
+	return &Tokens{
+		ClientID:              clientID,
+		AccessToken:           resp.AccessToken,
+		AccessTokenExpiresAt:  requestedAt.Add(time.Duration(resp.ExpiresIn) * time.Second),
+		RefreshToken:          resp.RefreshToken,
+		RefreshTokenExpiresAt: requestedAt.Add(time.Duration(resp.RefreshTokenExpiresIn) * time.Second),
+	}, nil
+}
 
-	if it.Token == nil {
-		return nil, fmt.Errorf("token field is missing from API response")
+func (t *Tokens) status() *Status {
+	return &Status{
+		ClientID:             t.ClientID,
+		AccessTokenExpiresAt: t.AccessTokenExpiresAt,
+		LoginExpiresAt:       t.RefreshTokenExpiresAt,
 	}
+}
 
-	return it.Token, nil
+// explainOAuthError adds a hint for errors caused by the App's configuration.
+func explainOAuthError(err error) error {
+	var oauthErr *OAuthError
+	if !errors.As(err, &oauthErr) {
+		return err
+	}
+	switch oauthErr.Code {
+	case "device_flow_disabled":
+		return fmt.Errorf("%w (turn on \"Enable Device Flow\" in the GitHub App's settings)", err)
+	case "incorrect_client_credentials":
+		return fmt.Errorf("%w (use the Client ID from the GitHub App's settings page, not the App ID)", err)
+	case "access_denied":
+		return fmt.Errorf("%w (the authorization request was cancelled)", err)
+	case "expired_token":
+		return fmt.Errorf("%w (the code expired before it was entered; run login again)", err)
+	}
+	return err
 }

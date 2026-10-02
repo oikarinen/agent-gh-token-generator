@@ -1,72 +1,135 @@
 #!/bin/bash
 #
-# A wrapper script to authenticate the GitHub CLI (`gh`) as a GitHub App.
+# Short-lived GitHub tokens for AI agents, issued through your GitHub App.
 #
-# This script retrieves your GitHub App configuration, calls a helper
-# program to generate a short-lived installation access token, and uses
-# that token to log in.
+# Authorize once with `agent-github-token login` (GitHub's device flow). The
+# tokens are kept in the macOS Keychain: the 8-hour access token renews
+# automatically, and the login lasts as long as it is used at least once every
+# 6 months. Access is limited to the repositories the App is installed on, and
+# to what both the App's permissions and your own account allow.
 
-set -e
+set -euo pipefail
 
 # --- Configuration -----------------------------------------------------------
-# Replace the placeholder values below with your GitHub App's credentials.
-#
-# GH_APP_ID: Found on your app's main settings page.
-# GH_APP_INSTALLATION_ID: Found in the URL after installing the app
-#                         (e.g., .../installations/12345678).
+# GH_APP_CLIENT_ID: the "Client ID" on your GitHub App's settings page (not the
+# App ID). Only `login` needs it. It can also be set in the environment.
 # -----------------------------------------------------------------------------
-GH_APP_ID="<Your-App-ID>"
-GH_APP_INSTALLATION_ID="<Your-Installation-ID>"
+GH_APP_CLIENT_ID="${GH_APP_CLIENT_ID:-<Your-Client-ID>}"
 
 # --- Script Body -------------------------------------------------------------
 # You shouldn't need to edit anything below this line.
 
-# Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 HELPER_NAME="gh-app-token-generator"
 HELPER_PATH="${SCRIPT_DIR}/${HELPER_NAME}"
+PROGRAM="${0##*/}"
+
+usage() {
+  cat <<EOF
+Usage: ${PROGRAM} <command>
+
+Commands:
+  login        Authorize in the browser with GitHub's device flow. Needed once,
+               and again only if unused for 6 months.
+  status       Show when the stored tokens expire
+  token        Print a valid access token, renewing it first if needed
+  gh ARGS...   Run gh with a fresh token, e.g. '${PROGRAM} gh pr list'.
+               Your own gh login is not changed.
+  setup-git    Make git use these tokens for https://github.com in the current
+               repository
+  logout       Remove the stored tokens from the Keychain
+EOF
+}
+
+# setup_git configures the current repository to get credentials for
+# https://github.com from the helper.
+setup_git() {
+  if ! command -v git &>/dev/null; then
+    echo "Error: git is not installed or not in your PATH." >&2
+    exit 1
+  fi
+  if ! git rev-parse --git-dir &>/dev/null; then
+    echo "Error: Run '${PROGRAM} setup-git' inside the git repository the agent works in." >&2
+    exit 1
+  fi
+
+  local key="credential.https://github.com.helper"
+  # The empty value clears helpers configured elsewhere for github.com (such as
+  # osxkeychain or 'gh auth setup-git'), so only this one is used.
+  git config --local --unset-all "${key}" || true
+  git config --local --add "${key}" ""
+  git config --local --add "${key}" "!'${HELPER_PATH}' git-credential"
+  echo "git now uses ${PROGRAM} tokens for https://github.com in this repository."
+
+  # Credential helpers only apply to HTTPS remotes.
+  local remote_key url name
+  while read -r remote_key url; do
+    name="${remote_key#remote.}"
+    name="${name%.url}"
+    case "${url}" in
+      git@github.com:* | ssh://*github.com[:/]*)
+        echo "Warning: Remote '${name}' uses SSH, which authenticates with your own SSH key instead." >&2
+        echo "         Switch it to HTTPS: git remote set-url ${name} https://github.com/OWNER/REPO.git" >&2
+        ;;
+    esac
+  done < <(git config --local --get-regexp '^remote\..*\.url$' || true)
+}
+
+cmd="${1:-}"
+case "${cmd}" in
+  -h | --help | help)
+    usage
+    exit 0
+    ;;
+  "")
+    usage >&2
+    exit 1
+    ;;
+esac
+shift
 
 # --- Pre-flight Checks ---
-# Check if running on macOS, as this script relies on the 'security' command.
+# The helper stores tokens in the macOS Keychain with the 'security' command.
 if [[ "$(uname)" != "Darwin" ]]; then
   echo "Error: This script is designed for macOS and relies on the 'security' command." >&2
   echo "It will not run on other operating systems." >&2
   exit 1
 fi
 
-# Check if the 'gh' command is available.
-if ! command -v gh &>/dev/null; then
-  echo "Error: The GitHub CLI ('gh') is not installed or not in your PATH." >&2
-  echo "Please install it from https://github.com/cli/cli#installation" >&2
-  exit 1
-fi
-
-# Check if the helper program exists.
 if [[ ! -f "${HELPER_PATH}" ]]; then
   echo "Error: The helper program '${HELPER_NAME}' was not found in the same directory as this script." >&2
   echo "Please build it first by running 'go build -o ${HELPER_PATH} ./cmd/gh-app-token-generator' from the repository root." >&2
   exit 1
 fi
 
-# --- Token Generation and Authentication ---
-echo "🤖 Generating GitHub App installation token..."
-
-# Call the helper to generate the token.
-# The token is printed to stdout.
-TOKEN=$("${HELPER_PATH}" "${GH_APP_ID}" "${GH_APP_INSTALLATION_ID}")
-if [[ -z "${TOKEN}" ]]; then
-  echo "Error: Failed to generate an installation token. The helper program produced no output." >&2
-  exit 1
-fi
-
-echo "🔐 Authenticating GitHub CLI..."
-
-# Use the generated token to log in with the 'gh' CLI.
-# The '--with-token' flag reads the token from standard input.
-if echo "${TOKEN}" | gh auth login --hostname github.com --with-token; then
-  echo "✅ Successfully authenticated 'gh' as your GitHub App."
-  echo "Run 'gh auth status' to verify."
-else
-  echo "Error: 'gh auth login' failed." >&2
-  exit 1
-fi
+case "${cmd}" in
+  login)
+    # Still empty or the "<...>" placeholder from the configuration section.
+    if [[ -z "${GH_APP_CLIENT_ID}" || "${GH_APP_CLIENT_ID}" == \<* ]]; then
+      echo "Error: Set GH_APP_CLIENT_ID at the top of this script (or in the environment) to your GitHub App's Client ID." >&2
+      exit 1
+    fi
+    exec "${HELPER_PATH}" login "${GH_APP_CLIENT_ID}"
+    ;;
+  status | token | logout)
+    exec "${HELPER_PATH}" "${cmd}" "$@"
+    ;;
+  gh)
+    if ! command -v gh &>/dev/null; then
+      echo "Error: The GitHub CLI ('gh') is not installed or not in your PATH." >&2
+      echo "Please install it from https://github.com/cli/cli#installation" >&2
+      exit 1
+    fi
+    # On failure the helper explains why (for example, that login is needed).
+    TOKEN="$("${HELPER_PATH}" token)"
+    GH_TOKEN="${TOKEN}" exec gh "$@"
+    ;;
+  setup-git)
+    setup_git
+    ;;
+  *)
+    echo "Error: Unknown command '${cmd}'." >&2
+    usage >&2
+    exit 1
+    ;;
+esac
